@@ -3,6 +3,18 @@ services:
     build: .
     image: offline-vector-tile-api:latest
     container_name: offline-vector-tile-api
+    # Two independent worker processes share the same SQLite database, so the
+    # cross-process revision race (and its BEGIN IMMEDIATE fix) is real and
+    # reproducible -- see README "并发发布复现".
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --workers
+      - "2"
     ports:
       - "8000:8000"
     environment:

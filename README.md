@@ -13,7 +13,7 @@
 | --- | --- |
 | 发布图层 | `POST /datasets` 上传 GeoJSON `FeatureCollection`（multipart 或原始 JSON body），创建数据集并发布 **revision 1** |
 | 不可变版本 | 每次发布写入一个新的 revision；历史 revision 永不被覆盖，可通过 `?revision=N` 固定取瓦片 |
-| 乐观并发控制 | 发布新版本必须携带 `expected_revision`，与当前 head 不一致时返回 **409 Conflict** |
+| 乐观并发控制 | 发布新版本必须携带 `expected_revision`，与当前 head 不一致时返回 **409 Conflict**；版本比较、修订插入、head 更新在**跨进程事务（`BEGIN IMMEDIATE`）**内原子完成，多个 worker 同时追加时恰好一个成功 |
 | 瓦片编译 | `GET /datasets/{id}/tiles/{z}/{x}/{y}.mvt`，支持 **z = 0–14** 的 XYZ 瓦片 |
 | 投影 | EPSG:4326 经纬度 → 球面 Web Mercator（R = 6378137），瓦片内坐标系为 4096 网格、Y 轴向下 |
 | 8 像素缓冲裁剪 | 点 / 线 / 面先裁剪到瓦片外扩 **8 px（128/4096 单位）**的边界，保证跨瓦片连续 |
@@ -39,7 +39,7 @@
 │   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache）
 │   └── config.py        # 环境变量配置
 ├── data/sample.geojson  # 示例图层（点 / 线 / 面）
-├── tests/               # pytest 测试（52 个用例）
+├── tests/               # pytest 测试（55 个用例，含跨进程并发回归）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -59,6 +59,8 @@ docker compose up -d --build
 - 交互文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/healthz>
 - SQLite 数据库保存在 Docker 命名卷 `tile-data`（容器内 `/data/tiles.db`），容器重建后数据不丢
+- Compose 默认以 **2 个独立 uvicorn worker 进程**（`--workers 2`）运行，二者共享同一个
+  SQLite 库；这正是“并发追加发布”竞态的真实部署形态，可直接用下一节的命令复现
 
 常用命令：
 
@@ -86,6 +88,16 @@ export VT_DB_PATH=./data/tiles.db          # SQLite 文件路径
 ```bash
 .venv/bin/pip install pytest
 .venv/bin/python -m pytest -q
+```
+
+不用 Docker 也想复现跨进程竞态时，启动**两个指向同一 SQLite 文件**的 uvicorn，
+再分别向两个端口并发 POST（等价于 Compose 的 `--workers 2`）：
+
+```bash
+export VT_DB_PATH=./data/tiles.db
+.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8001 &
+.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8002 &
+# 之后让两个请求分别打到 8001 与 8002（把 4.2.1 示例中的 8000 换成对应端口）
 ```
 
 ---
@@ -164,6 +176,88 @@ HTTP/1.1 409 Conflict
 
 客户端应重新拉取 head、合并变更后，再用新的 `expected_revision` 重试。
 
+### 4.2.1 并发追加发布复现（两个 worker 同时提交同一 expected_revision）
+
+Compose 已按 **2 个 worker 进程**启动，下面用一段 shell 把两个请求**同时**发往服务
+（`curl ... &` 后统一 `wait`）。二者都读到 head=1、都带 `expected_revision=1`，
+但版本比较、修订插入与 head 更新在跨进程的 `BEGIN IMMEDIATE` 事务内串行完成：
+**恰好一方得到 201，另一方得到 409，且 409 的 `current_revision` 指向新 head。**
+
+先发布 revision 1 并取出数据集 ID：
+
+```bash
+DS=$(curl -s -X POST "http://localhost:8000/datasets?layer=demo" \
+  -H "Content-Type: application/json" \
+  --data-binary @data/sample.geojson | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+echo "$DS"
+# 55e7b06cf2d748a7b38b135c63592142
+```
+
+同时发两个追加请求（multipart 形式，与单请求示例等价）：
+
+```bash
+curl -s -o /tmp/racer1.json -w "racer1 -> HTTP %{http_code}\n" \
+  -X POST "http://localhost:8000/datasets/$DS/revisions" \
+  -F "file=@data/sample.geojson;type=application/geo+json" \
+  -F "expected_revision=1" &
+curl -s -o /tmp/racer2.json -w "racer2 -> HTTP %{http_code}\n" \
+  -X POST "http://localhost:8000/datasets/$DS/revisions" \
+  -F "file=@data/sample.geojson;type=application/geo+json" \
+  -F "expected_revision=1" &
+wait
+```
+
+真实输出（每次运行只有一方赢，顺序可能互换）：
+
+```text
+racer1 -> HTTP 201
+racer2 -> HTTP 409
+```
+
+胜者 `201 Created`（`/tmp/racer1.json`）：
+
+```json
+{
+  "id": "55e7b06cf2d748a7b38b135c63592142",
+  "layer": "demo",
+  "revision": 2,
+  "content_hash": "96b7b15130feb9a517c348cf985e007217e29c456f4baa80b728ee7186408",
+  "feature_count": 4,
+  "published_at": "2026-09-30T13:00:37Z"
+}
+```
+
+败者 `409 Conflict`（`/tmp/racer2.json`），`current_revision` 即新 head：
+
+```json
+{
+  "error": "revision conflict: expected_revision does not match current head",
+  "dataset_id": "55e7b06cf2d748a7b38b135c63592142",
+  "expected_revision": 1,
+  "current_revision": 2
+}
+```
+
+验证“没有额外版本、没有半提交”，且**历史 revision 1 的瓦片仍可读取**：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("latest:",d["latest_revision"],"revisions:",[r["revision"] for r in d["revisions"]])'
+# latest: 2 revisions: [1, 2]
+
+# 固定取历史 revision 1（注意响应头 x-revision: 1，缓存策略为 immutable）
+curl -s -D - -o /dev/null "http://localhost:8000/datasets/$DS/tiles/0/0/0.mvt?revision=1" | grep -iE "^HTTP|x-revision"
+# HTTP/1.1 200 OK
+# x-revision: 1
+
+# 不带 revision 时取当前 head（x-revision: 2）
+curl -s -D - -o /dev/null "http://localhost:8000/datasets/$DS/tiles/0/0/0.mvt" | grep -iE "^HTTP|x-revision"
+# HTTP/1.1 200 OK
+# x-revision: 2
+```
+
+> 压测可把并发数提高，例如 `for i in $(seq 1 10); do curl ... & done; wait`：
+> 结果始终是 **1 × 201，9 × 409**，head 只前进一版，服务端不会出现 500。
+
 ### 4.3 查看数据集与版本列表
 
 ```bash
@@ -237,7 +331,7 @@ curl -i -H 'If-None-Match: "75dd0d37d05a70e4ed743cb72731f3bb8f3d0a513cfa58a1b473
 | GeoJSON 不是 FeatureCollection / 空集合 / JSON 解析失败 / 坐标越界 / 自交多边形 / null 几何 | `400` |
 | 瓦片 `z` 超出 0–14、`x/y` 为负或超出该级别范围、非整数 | `400` |
 | 数据集或 `revision` 不存在 | `404` |
-| 发布版本时 `expected_revision` 与 head 不一致 | `409` |
+| 发布版本时 `expected_revision` 与 head 不一致（含跨进程并发落败，`current_revision` 指向新 head） | `409` |
 | 上传体积超过限制（默认 50 MB） | `413` |
 
 ```bash
@@ -286,7 +380,46 @@ ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务
 
 ---
 
-## 6. API 速览
+## 6. 并发与事务语义（跨进程）
+
+追加发布 `POST /datasets/{id}/revisions` 必须是一次跨进程原子的
+**比较并设置（compare-and-set）**：
+
+```text
+比较 latest_revision == expected_revision
+  → 插入 revisions(next)
+  → 更新 datasets.latest_revision = next
+```
+
+实现要点（见 `app/db.py`）：
+
+1. 连接以 `isolation_level=None`（autocommit）打开，Python 不会在背后隐式开启
+   延迟事务；写操作统一走显式的 `write_transaction()`。
+2. 追加发布以 **`BEGIN IMMEDIATE`** 开启事务：进入时即取得 SQLite（WAL 模式）唯一的
+   **数据库级写锁**。因此无论请求来自同一进程的线程，还是**不同 worker / 容器进程**，
+   这段“比较 → 插入 → 更新”都被该写锁串行化。
+3. 落败方在拿到锁后重新读到的已是新 head，比较失败 → 抛 `RevisionConflict`
+   （HTTP **409**，响应体 `current_revision` 指向新 head），事务回滚，
+   **不会**再去撞 `revisions` 的主键而冒出未映射的 500。
+4. 插入与 head 更新在同一事务内提交：要么都成功（201，仅一个新 revision），
+   要么都回滚（409），不存在“插了修订但 head 没动”或多出一个版本的半提交状态。
+   `UPDATE datasets ... WHERE latest_revision = <读到的值>` 再加一道行级条件，
+   并把任何残留的 `IntegrityError` 统一映射为 409 作为兜底。
+5. 修订内容不可变，旧 revision 行从不更新或删除，因此发布新版本后
+   `?revision=N` 仍能读到历史瓦片；历史瓦片缓存也按 `(dataset, revision, z, x, y)`
+   独立存放，不受 head 前进影响。
+
+冷启动方面：多个 worker 可能在全新数据卷上**并发初始化**。连接在切换
+`journal_mode=WAL`（一次性、需要排他锁）**之前**先设置 `busy_timeout`，
+并对初始化做了重试，因此两个 worker 同时首启也不会因 `database is locked` 而启动失败。
+
+并发回归测试见 `tests/test_concurrency.py`：它用 `multiprocessing` 拉起 **4 个真实
+操作系统进程**、各自持有独立连接并在屏障处同时提交，连续 10 轮断言
+“恰 1 个 created、其余 3 个 conflict 且都指向新 head、版本数与 head 一致”。
+
+---
+
+## 7. API 速览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -300,7 +433,7 @@ ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务
 
 ---
 
-## 7. 配置（环境变量）
+## 8. 配置（环境变量）
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |

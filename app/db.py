@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
@@ -61,20 +61,41 @@ def utc_now_iso() -> str:
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(settings.db_path, timeout=30, check_same_thread=False)
+    # isolation_level=None puts the driver in autocommit mode, so Python never
+    # opens a (deferred) transaction behind our backs.  All multi-statement
+    # writes are wrapped explicitly in ``write_transaction`` below.
+    conn = sqlite3.connect(
+        settings.db_path, timeout=30, check_same_thread=False, isolation_level=None
+    )
     conn.row_factory = sqlite3.Row
+    # busy_timeout must be configured *before* switching journal_mode: on a
+    # brand-new database, several processes can race the one-time WAL
+    # conversion (which needs an exclusive lock).  Without the timeout the
+    # PRAGMA returns SQLITE_BUSY immediately and a second worker crashes at
+    # startup.
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
 def init_db() -> None:
     import os
+    import sqlite3 as _sqlite3
 
     os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
-    with _connect() as conn:
-        conn.executescript(_SCHEMA)
+    # Multiple workers start concurrently and may race the one-time WAL setup
+    # on a fresh volume; busy_timeout already makes them queue, but retry once
+    # more on a lock so a cold start never takes a worker down.
+    for attempt in range(5):
+        try:
+            with _connect() as conn:
+                conn.executescript(_SCHEMA)
+            return
+        except _sqlite3.OperationalError:
+            if attempt == 4:
+                raise
+            time.sleep(0.1 * (attempt + 1))
 
 
 @contextmanager
@@ -86,9 +107,32 @@ def connection() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-# A single process-wide write lock serialises publishes so the
-# expected_revision compare-and-set cannot race inside one uvicorn worker.
-_publish_lock = threading.Lock()
+@contextmanager
+def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Cross-process write transaction.
+
+    ``BEGIN IMMEDIATE`` acquires the database write lock (the only writer lock
+    in WAL mode) up front, so the compare-and-set for a new revision is
+    serialised against *all* processes sharing this database, not only other
+    threads in one worker.  Any concurrent ``BEGIN IMMEDIATE`` blocks here for
+    up to ``busy_timeout`` and then runs against the new head, which makes the
+    loser re-read the advanced revision and return a clean 409 instead of
+    hitting the revisions primary key.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
+
+
+# No in-process lock is needed for revision publishing: write_transaction()
+# takes SQLite's cross-process write lock (BEGIN IMMEDIATE), which serialises
+# the expected_revision compare-and-set both between threads and between
+# separate worker processes / containers sharing the same database file.
 
 
 def get_dataset(conn: sqlite3.Connection, dataset_id: str) -> sqlite3.Row | None:
@@ -121,7 +165,7 @@ def publish_initial_revision(
     theoretical safety net.
     """
     now = utc_now_iso()
-    with _publish_lock:
+    with write_transaction(conn):
         existing = conn.execute(
             "SELECT 1 FROM datasets WHERE id = ?", (dataset_id,)
         ).fetchone()
@@ -138,7 +182,6 @@ def publish_initial_revision(
             "VALUES (?, 1, ?, ?, ?, ?)",
             (dataset_id, content_hash, feature_count, geojson_blob, now),
         )
-        conn.commit()
     return {
         "id": dataset_id,
         "layer": layer,
@@ -157,9 +200,17 @@ def publish_next_revision(
     feature_count: int,
     expected_revision: int,
 ) -> dict[str, Any]:
-    """Append an immutable revision using optimistic concurrency control."""
+    """Append an immutable revision using optimistic concurrency control.
+
+    The head comparison, the revision insert and the head update run inside
+    one cross-process ``BEGIN IMMEDIATE`` transaction, so concurrent appenders
+    are serialised on the SQLite write lock: exactly one caller creates the
+    next revision and every other caller gets ``RevisionConflict`` carrying
+    the new head.  There is no window for an unmapped primary-key error and no
+    possibility of an inserted revision without an updated head.
+    """
     now = utc_now_iso()
-    with _publish_lock:
+    with write_transaction(conn):
         row = conn.execute(
             "SELECT latest_revision, layer FROM datasets WHERE id = ?",
             (dataset_id,),
@@ -170,24 +221,44 @@ def publish_next_revision(
         if current != expected_revision:
             raise RevisionConflict(current)
         next_revision = current + 1
-        conn.execute(
-            "INSERT INTO revisions "
-            "(dataset_id, revision, content_hash, feature_count, geojson, published_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                dataset_id,
-                next_revision,
-                content_hash,
-                feature_count,
-                geojson_blob,
-                now,
-            ),
-        )
-        conn.execute(
-            "UPDATE datasets SET latest_revision = ? WHERE id = ?",
-            (next_revision, dataset_id),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                "INSERT INTO revisions "
+                "(dataset_id, revision, content_hash, feature_count, geojson, published_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    dataset_id,
+                    next_revision,
+                    content_hash,
+                    feature_count,
+                    geojson_blob,
+                    now,
+                ),
+            )
+            cur = conn.execute(
+                "UPDATE datasets SET latest_revision = ? "
+                "WHERE id = ? AND latest_revision = ?",
+                (next_revision, dataset_id, current),
+            )
+        except sqlite3.IntegrityError:
+            # Defensive: the guarded UPDATE + BEGIN IMMEDIATE already make this
+            # unreachable, but a duplicate (dataset_id, revision) must never
+            # surface as an unmapped 500 -- report the head that won instead.
+            winner = conn.execute(
+                "SELECT latest_revision FROM datasets WHERE id = ?",
+                (dataset_id,),
+            ).fetchone()
+            raise RevisionConflict(
+                winner["latest_revision"] if winner is not None else next_revision - 1
+            )
+        if cur.rowcount != 1:
+            winner = conn.execute(
+                "SELECT latest_revision FROM datasets WHERE id = ?",
+                (dataset_id,),
+            ).fetchone()
+            raise RevisionConflict(
+                winner["latest_revision"] if winner is not None else next_revision - 1
+            )
     return {
         "id": dataset_id,
         "layer": row["layer"],
