@@ -12,6 +12,9 @@ services:
       VT_MIN_ZOOM: "0"
       VT_MAX_ZOOM: "14"
       VT_MAX_UPLOAD_BYTES: "52428800"
+      # Two independent uvicorn worker processes share the SQLite file so the
+      # cross-process append-revision race can be reproduced via the HTTP API.
+      VT_WORKERS: "2"
     volumes:
       - tile-data:/data
     restart: unless-stopped

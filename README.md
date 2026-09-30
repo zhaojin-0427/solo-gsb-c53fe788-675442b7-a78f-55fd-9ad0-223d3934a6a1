@@ -13,7 +13,7 @@
 | --- | --- |
 | 发布图层 | `POST /datasets` 上传 GeoJSON `FeatureCollection`（multipart 或原始 JSON body），创建数据集并发布 **revision 1** |
 | 不可变版本 | 每次发布写入一个新的 revision；历史 revision 永不被覆盖，可通过 `?revision=N` 固定取瓦片 |
-| 乐观并发控制 | 发布新版本必须携带 `expected_revision`，与当前 head 不一致时返回 **409 Conflict** |
+| 乐观并发控制 | 发布新版本必须携带 `expected_revision`，与当前 head 不一致时返回 **409 Conflict**；head 比较、revision 插入与 head 更新在单个跨进程有效的 `BEGIN IMMEDIATE` 事务内原子完成，多 worker 并发追加也只有一方成功 |
 | 瓦片编译 | `GET /datasets/{id}/tiles/{z}/{x}/{y}.mvt`，支持 **z = 0–14** 的 XYZ 瓦片 |
 | 投影 | EPSG:4326 经纬度 → 球面 Web Mercator（R = 6378137），瓦片内坐标系为 4096 网格、Y 轴向下 |
 | 8 像素缓冲裁剪 | 点 / 线 / 面先裁剪到瓦片外扩 **8 px（128/4096 单位）**的边界，保证跨瓦片连续 |
@@ -36,10 +36,10 @@
 │   ├── tiler.py         # 裁剪 / 简化 / 量化 / 稳定排序 / MVT 编码
 │   ├── projection.py    # EPSG:4326 -> Web Mercator -> 瓦片 4096 网格
 │   ├── geojson.py       # GeoJSON 校验与规范化
-│   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache）
+│   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache，跨进程事务）
 │   └── config.py        # 环境变量配置
 ├── data/sample.geojson  # 示例图层（点 / 线 / 面）
-├── tests/               # pytest 测试（52 个用例）
+├── tests/               # pytest 测试（54 个用例，含跨进程追加发布竞态回归）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -59,6 +59,9 @@ docker compose up -d --build
 - 交互文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/healthz>
 - SQLite 数据库保存在 Docker 命名卷 `tile-data`（容器内 `/data/tiles.db`），容器重建后数据不丢
+- 默认以 **2 个 uvicorn worker 进程**启动（`VT_WORKERS=2`），两个进程共享同一个
+  SQLite 文件；跨进程的追加发布由 `BEGIN IMMEDIATE` 事务串行化，可直接按
+  [§4.2](#42-发布新版本乐观并发控制) 末尾的并发命令复核竞态
 
 常用命令：
 
@@ -78,7 +81,8 @@ docker compose down -v       # 停止并删除数据卷
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 export VT_DB_PATH=./data/tiles.db          # SQLite 文件路径
-.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+# 追加发布的跨进程竞态可像 Docker 一样用多 worker 复核：追加 --workers 2
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
 ```
 
 运行测试：
@@ -163,6 +167,101 @@ HTTP/1.1 409 Conflict
 ```
 
 客户端应重新拉取 head、合并变更后，再用新的 `expected_revision` 重试。
+
+#### 并发发布（跨进程竞态复核）
+
+乐观锁的比较与写入在单个 `BEGIN IMMEDIATE` 事务内完成（比较 head → 插入新
+revision → 更新 head 原子提交，见 `app/db.py` 的 `publish_next_revision`）。
+因此即使**两个独立工作进程**以相同的 `expected_revision` 同时提交，也只有一方
+得到 `201`，其余方返回结构不变的 `409`（`current_revision` 指向新 head），不会
+出现重复版本、半提交或未映射的数据库错误。
+
+下面用 8 个并发请求同时把 `expected_revision=1` 追加到同一数据集（Compose 默认
+就是 2 个 worker 进程共享同一库；`xargs -P8` 让请求真正同时发出）：
+
+```bash
+seq 8 | xargs -P8 -I{} sh -c '
+  curl -s -o /tmp/race-{}.json -w "request %{http_code}\n" \
+    -X POST "http://localhost:8000/datasets/$DS/revisions" \
+    -F "file=@data/sample.geojson;type=application/geo+json" \
+    -F "expected_revision=1"'
+```
+
+实测结果——**恰好 1 个 201，7 个 409**（哪一个请求成为 201 取决于调度，每次运行
+可能不同）：
+
+```text
+request 201
+request 409
+request 409
+request 409
+request 409
+request 409
+request 409
+request 409
+```
+
+获胜请求的 `201 Created` 响应体：
+
+```json
+{
+    "id": "25c78460dd9745c5a36c37169b7e3458",
+    "layer": "demo",
+    "revision": 2,
+    "content_hash": "96b7b15130feb9a517c348cf985e007217e29c456f4baa80b728ee7186408",
+    "feature_count": 4,
+    "published_at": "2026-09-30T06:58:41Z"
+}
+```
+
+落败请求的 `409 Conflict` 响应（`-i` 同时显示状态行）：
+
+```http
+HTTP/1.1 409 Conflict
+content-type: application/json
+```
+
+```json
+{
+  "error": "revision conflict: expected_revision does not match current head",
+  "dataset_id": "25c78460dd9745c5a36c37169b7e3458",
+  "expected_revision": 1,
+  "current_revision": 2
+}
+```
+
+确认库里没有产生额外版本（只有 revision 1、2，head 为 2）：
+
+```bash
+curl -s http://localhost:8000/datasets/$DS | python3 -m json.tool
+```
+
+```json
+{
+  "id": "25c78460dd9745c5a36c37169b7e3458",
+  "layer": "demo",
+  "latest_revision": 2,
+  "revisions": [
+    { "revision": 1, "...": "..." },
+    { "revision": 2, "...": "..." }
+  ]
+}
+```
+
+历史 revision 不可变，仍可按旧版本读取瓦片（响应头 `x-revision: 1`，固定版本为
+`immutable` 缓存）：
+
+```bash
+curl -s -D - -o /tmp/r1.mvt \
+  "http://localhost:8000/datasets/$DS/tiles/0/0/0.mvt?revision=1"
+```
+
+```http
+HTTP/1.1 200 OK
+etag: "75dd0d37d05a70e4ed743cb72731f3bb8f3d0a513cfa58a1b473c3e265f4a481"
+x-revision: 1
+cache-control: public, max-age=31536000, immutable
+```
 
 ### 4.3 查看数据集与版本列表
 
@@ -308,4 +407,5 @@ ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务
 | `VT_HOST` / `VT_PORT` | `0.0.0.0` / `8000` | 监听地址与端口 |
 | `VT_MIN_ZOOM` / `VT_MAX_ZOOM` | `0` / `14` | 允许编译的缩放级别范围 |
 | `VT_MAX_UPLOAD_BYTES` | `52428800` | 单次上传大小上限（50 MB） |
+| `VT_WORKERS` | `2`（Docker） | uvicorn 工作进程数；多进程共享同一 SQLite 文件，追加发布由跨进程事务串行化 |
 | `VT_TILE_CACHE_SIZE` | `4096` | 进程内瓦片 LRU 缓存条目数 |
